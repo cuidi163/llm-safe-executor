@@ -1,0 +1,14 @@
+# Binaries
+llm-safe-executor
+*.exe
+*.test
+
+# Logs
+*.log
+
+# IDE
+.vscode/
+.idea/
+
+# Docker
+.DS_Store
