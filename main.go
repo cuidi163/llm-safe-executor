@@ -1,9 +1,12 @@
-// main.go
+// main.go (Day 2 版本)
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"os/signal"
@@ -25,6 +28,12 @@ type MCPRequest struct {
 	ID      interface{} `json:"id"`
 }
 
+// 新增：call_tool 的参数结构
+type CallToolParams struct {
+	Name string                 `json:"name"`
+	Args map[string]interface{} `json:"arguments"`
+}
+
 type MCPResponse struct {
 	JSONRPC string      `json:"jsonrpc"`
 	Result  interface{} `json:"result,omitempty"`
@@ -35,6 +44,70 @@ type MCPResponse struct {
 type MCPError struct {
 	Code    int    `json:"code"`
 	Message string `json:"message"`
+}
+
+// 新增：Serper API 响应结构
+type SerperResponse struct {
+	Organic []struct {
+		Title   string `json:"title"`
+		Link    string `json:"link"`
+		Snippet string `json:"snippet"`
+	} `json:"organic"`
+}
+
+// 新增：执行 search 工具
+func searchTool(query string, logger *zap.Logger) (interface{}, error) {
+	apiKey := os.Getenv("SERPER_API_KEY")
+	if apiKey == "" {
+		return nil, fmt.Errorf("SERPER_API_KEY environment variable not set")
+	}
+
+	url := "https://google.serper.dev/search"
+	payload := map[string]string{"q": query}
+	body, _ := json.Marshal(payload)
+
+	req, err := http.NewRequest("POST", url, bytes.NewBuffer(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("X-API-KEY", apiKey)
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		logger.Error("Serper API request failed", zap.Error(err))
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		logger.Error("Serper API returned non-200", zap.Int("status", resp.StatusCode), zap.ByteString("body", body))
+		return nil, fmt.Errorf("serper api error: %d", resp.StatusCode)
+	}
+
+	var serperResp SerperResponse
+	if err := json.NewDecoder(resp.Body).Decode(&serperResp); err != nil {
+		return nil, err
+	}
+
+	// 只返回前 3 个结果（节省 token）
+	results := []map[string]string{}
+	for i, item := range serperResp.Organic {
+		if i >= 3 {
+			break
+		}
+		results = append(results, map[string]string{
+			"title":   item.Title,
+			"link":    item.Link,
+			"snippet": item.Snippet,
+		})
+	}
+
+	return map[string]interface{}{
+		"results": results,
+	}, nil
 }
 
 func handleMCP(ws *websocket.Conn, logger *zap.Logger) {
@@ -64,7 +137,7 @@ func handleMCP(ws *websocket.Conn, logger *zap.Logger) {
 		case "initialize":
 			resp.Result = map[string]interface{}{
 				"protocolVersion": "2024-11-05",
-				"capabilities":    map[string]interface{}{"tools": map[string]bool{"list": true}},
+				"capabilities":    map[string]interface{}{"tools": map[string]bool{"list": true, "call": true}},
 			}
 		case "list_tools":
 			resp.Result = []map[string]interface{}{
@@ -91,6 +164,35 @@ func handleMCP(ws *websocket.Conn, logger *zap.Logger) {
 					},
 				},
 			}
+		case "call_tool":
+			// 解析 call_tool 参数
+			paramsBytes, _ := json.Marshal(req.Params)
+			var callParams CallToolParams
+			if err := json.Unmarshal(paramsBytes, &callParams); err != nil {
+				resp.Error = &MCPError{Code: -32602, Message: "Invalid params for call_tool"}
+				break
+			}
+
+			var result interface{}
+			var execErr error
+
+			switch callParams.Name {
+			case "search":
+				query, ok := callParams.Args["query"].(string)
+				if !ok || query == "" {
+					execErr = fmt.Errorf("missing 'query' argument")
+				} else {
+					result, execErr = searchTool(query, logger)
+				}
+			default:
+				execErr = fmt.Errorf("tool not found: %s", callParams.Name)
+			}
+
+			if execErr != nil {
+				resp.Error = &MCPError{Code: -32000, Message: execErr.Error()}
+			} else {
+				resp.Result = result
+			}
 		default:
 			resp.Error = &MCPError{Code: -32601, Message: "Method not found: " + req.Method}
 		}
@@ -116,7 +218,6 @@ func main() {
 		go handleMCP(conn, logger)
 	})
 
-	// Health check
 	http.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("ok"))
@@ -127,7 +228,6 @@ func main() {
 		Handler: nil,
 	}
 
-	// Graceful shutdown
 	done := make(chan bool, 1)
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
