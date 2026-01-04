@@ -1,4 +1,4 @@
-// main.go (修复版)
+// main.go - Day 4: Robustness & Observability
 package main
 
 import (
@@ -13,6 +13,8 @@ import (
 	"os/signal"
 	"runtime"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -27,6 +29,15 @@ import (
 var upgrader = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool { return true },
 }
+
+// ====== Metrics (Day 4) ======
+var (
+	totalRequests    int64
+	failedRequests   int64
+	codeExecDuration float64
+	searchDuration   float64
+	metricsMutex     sync.RWMutex
+)
 
 type MCPRequest struct {
 	JSONRPC string      `json:"jsonrpc"`
@@ -60,23 +71,18 @@ type SerperResponse struct {
 	} `json:"organic"`
 }
 
-// createDockerClient 尝试以多种方式创建 Docker 客户端，优先使用环境变量，然后尝试 OrbStack、Docker Desktop 和标准路径。
+// createDockerClient 尝试以多种方式创建 Docker 客户端
 func createDockerClient() (*client.Client, error) {
-	// 1. 优先尝试从环境变量创建客户端 (DOCKER_HOST)
 	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 	if err == nil {
-		// 尝试 Ping Docker daemon 确认连接可用
 		_, err = cli.Ping(context.Background())
 		if err == nil {
 			return cli, nil
 		}
-		cli.Close() // 如果 Ping 失败，关闭客户端
+		cli.Close()
 	}
 
-	// 2. 如果环境变量失败，尝试其他常见路径
 	var potentialHosts []string
-
-	// OrbStack (macOS)
 	if runtime.GOOS == "darwin" {
 		homeDir, err := os.UserHomeDir()
 		if err == nil {
@@ -84,24 +90,19 @@ func createDockerClient() (*client.Client, error) {
 			potentialHosts = append(potentialHosts, orbstackSocket)
 		}
 	}
-
-	// Docker Desktop (macOS/Windows WSL2) 和标准 Linux 路径
-	potentialHosts = append(potentialHosts,
-		"unix:///var/run/docker.sock",
-	)
+	potentialHosts = append(potentialHosts, "unix:///var/run/docker.sock")
 
 	var lastErr error
 	for _, host := range potentialHosts {
 		cli, err := client.NewClientWithOpts(client.WithHost(host), client.WithAPIVersionNegotiation())
 		if err == nil {
-			// 尝试 Ping Docker daemon 确认连接可用
 			_, err = cli.Ping(context.Background())
 			if err == nil {
 				return cli, nil
 			}
-			cli.Close() // 如果 Ping 失败，关闭客户端
+			cli.Close()
 		}
-		lastErr = err // 记录最后一个错误
+		lastErr = err
 	}
 
 	if lastErr != nil {
@@ -110,16 +111,12 @@ func createDockerClient() (*client.Client, error) {
 	return nil, fmt.Errorf("failed to create docker client: no suitable host found")
 }
 
-// ensureImageExists 确保指定的 Docker 镜像存在，如果不存在则自动拉取
 func ensureImageExists(ctx context.Context, cli *client.Client, imageName string, logger *zap.Logger) error {
-	// 检查镜像是否已存在
 	_, _, err := cli.ImageInspectWithRaw(ctx, imageName)
 	if err == nil {
-		// 镜像已存在
 		return nil
 	}
 
-	// 镜像不存在，开始拉取
 	logger.Info("Pulling Docker image", zap.String("image", imageName))
 	reader, err := cli.ImagePull(ctx, imageName, image.PullOptions{})
 	if err != nil {
@@ -127,7 +124,6 @@ func ensureImageExists(ctx context.Context, cli *client.Client, imageName string
 	}
 	defer reader.Close()
 
-	// 读取拉取进度（避免阻塞）
 	_, err = io.Copy(io.Discard, reader)
 	if err != nil {
 		return fmt.Errorf("failed to read pull progress: %w", err)
@@ -137,7 +133,7 @@ func ensureImageExists(ctx context.Context, cli *client.Client, imageName string
 	return nil
 }
 
-// ====== 修复：移除代码缩进，直接使用原始代码 ======
+// executePythonInSandbox 执行 Python 代码（带资源限制和超时）
 func executePythonInSandbox(code string, logger *zap.Logger) (string, error) {
 	ctx := context.Background()
 
@@ -147,7 +143,7 @@ func executePythonInSandbox(code string, logger *zap.Logger) (string, error) {
 	}
 	defer cli.Close()
 
-	// Indent code to fit into try block
+	// 缩进代码以适配 try 块
 	indentedCode := ""
 	lines := strings.Split(code, "\n")
 	for _, line := range lines {
@@ -166,7 +162,7 @@ except Exception as e:
 `, indentedCode)
 
 	encodedScript := base64.StdEncoding.EncodeToString([]byte(script))
-	// 使用 -D 兼容 macOS 和 Linux
+	// 注意：容器内是 Linux，base64 -d 完全兼容
 	shellCmd := fmt.Sprintf("echo %s | base64 -d > /tmp/script.py && python /tmp/script.py", encodedScript)
 
 	containerConfig := &container.Config{
@@ -206,24 +202,19 @@ except Exception as e:
 		return "", fmt.Errorf("failed to start container: %w", err)
 	}
 
-	// 等待容器完成（带超时）
 	waitCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
 	statusCh, errCh := cli.ContainerWait(waitCtx, resp.ID, container.WaitConditionNotRunning)
 	select {
 	case err := <-errCh:
-		if err != nil {
-			return "", fmt.Errorf("container wait error: %w", err)
-		}
+		cli.ContainerRemove(ctx, resp.ID, container.RemoveOptions{Force: true})
+		return "", fmt.Errorf("container wait error: %w", err)
 	case <-statusCh:
-		// Container execution completed
+		// OK
 	case <-waitCtx.Done():
 		logger.Warn("Container execution timed out", zap.String("containerID", resp.ID))
-		// 强制删除超时容器
-		if removeErr := cli.ContainerRemove(ctx, resp.ID, container.RemoveOptions{Force: true}); removeErr != nil {
-			logger.Error("Failed to force remove timed-out container", zap.Error(removeErr))
-		}
+		cli.ContainerRemove(ctx, resp.ID, container.RemoveOptions{Force: true})
 		return "", fmt.Errorf("execution timed out after 5 seconds")
 	}
 
@@ -244,10 +235,8 @@ except Exception as e:
 	output := strings.TrimSpace(stdoutBuf.String())
 	errors := strings.TrimSpace(stderrBuf.String())
 
-	// 强制删除容器（双重保险）
-	if removeErr := cli.ContainerRemove(ctx, resp.ID, container.RemoveOptions{Force: true}); removeErr != nil {
-		logger.Error("Failed to remove container", zap.Error(removeErr))
-	}
+	// 最终清理（AutoRemove 可能失败）
+	cli.ContainerRemove(ctx, resp.ID, container.RemoveOptions{Force: true})
 
 	if errors != "" {
 		return fmt.Sprintf("Execution failed:\n%s", errors), nil
@@ -258,7 +247,10 @@ except Exception as e:
 	return output, nil
 }
 
-// ====== 原有 searchTool 函数（略作优化） ======
+// ====== searchTool with retry (Day 4) ======
+const maxRetries = 2
+const retryDelay = 500 * time.Millisecond
+
 func searchTool(query string, logger *zap.Logger) (interface{}, error) {
 	apiKey := os.Getenv("SERPER_API_KEY")
 	if apiKey == "" {
@@ -269,54 +261,65 @@ func searchTool(query string, logger *zap.Logger) (interface{}, error) {
 	payload := map[string]string{"q": query}
 	body, _ := json.Marshal(payload)
 
-	req, err := http.NewRequest("POST", url, bytes.NewBuffer(body))
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("X-API-KEY", apiKey)
-	req.Header.Set("Content-Type", "application/json")
+	var lastErr error
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		if attempt > 0 {
+			logger.Warn("Retrying Serper API call", zap.String("query", query), zap.Int("attempt", attempt))
+			time.Sleep(retryDelay)
+		}
 
-	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		logger.Error("Serper API request failed", zap.Error(err))
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, err := io.ReadAll(resp.Body)
+		req, err := http.NewRequest("POST", url, bytes.NewBuffer(body))
 		if err != nil {
-			logger.Error("Failed to read response body", zap.Error(err))
-			return nil, err
+			lastErr = err
+			continue
 		}
-		logger.Error("Serper API returned non-200", zap.Int("status", resp.StatusCode), zap.ByteString("body", body))
-		return nil, fmt.Errorf("serper api error: %d", resp.StatusCode)
-	}
+		req.Header.Set("X-API-KEY", apiKey)
+		req.Header.Set("Content-Type", "application/json")
 
-	var serperResp SerperResponse
-	if err := json.NewDecoder(resp.Body).Decode(&serperResp); err != nil {
-		return nil, err
-	}
-
-	results := []map[string]string{}
-	for i, item := range serperResp.Organic {
-		if i >= 3 {
-			break
+		client := &http.Client{Timeout: 10 * time.Second}
+		resp, err := client.Do(req)
+		if err != nil {
+			lastErr = err
+			logger.Warn("Serper API request failed", zap.Error(err), zap.Int("attempt", attempt))
+			continue
 		}
-		results = append(results, map[string]string{
-			"title":   item.Title,
-			"link":    item.Link,
-			"snippet": item.Snippet,
-		})
+
+		if resp.StatusCode == http.StatusOK {
+			defer resp.Body.Close()
+			var serperResp SerperResponse
+			if err := json.NewDecoder(resp.Body).Decode(&serperResp); err != nil {
+				lastErr = err
+				continue
+			}
+
+			results := []map[string]string{}
+			for i, item := range serperResp.Organic {
+				if i >= 3 {
+					break
+				}
+				results = append(results, map[string]string{
+					"title":   item.Title,
+					"link":    item.Link,
+					"snippet": item.Snippet,
+				})
+			}
+
+			return map[string]interface{}{"results": results}, nil
+		} else {
+			bodyBytes, _ := io.ReadAll(resp.Body)
+			resp.Body.Close() // 关闭以便重试
+			lastErr = fmt.Errorf("serper api returned %d: %s", resp.StatusCode, string(bodyBytes))
+			logger.Warn("Serper API non-200 response",
+				zap.Int("status", resp.StatusCode),
+				zap.ByteString("body", bodyBytes),
+				zap.Int("attempt", attempt))
+		}
 	}
 
-	return map[string]interface{}{
-		"results": results,
-	}, nil
+	return nil, fmt.Errorf("search failed after %d retries: %w", maxRetries+1, lastErr)
 }
 
-// ====== MCP 处理逻辑 ======
+// ====== MCP Handler with Metrics (Day 4) ======
 func handleMCP(ws *websocket.Conn, logger *zap.Logger) {
 	defer ws.Close()
 
@@ -329,8 +332,11 @@ func handleMCP(ws *websocket.Conn, logger *zap.Logger) {
 			break
 		}
 
+		atomic.AddInt64(&totalRequests, 1)
+
 		var req MCPRequest
 		if err := json.Unmarshal(msg, &req); err != nil {
+			atomic.AddInt64(&failedRequests, 1)
 			logger.Error("Failed to unmarshal MCP request", zap.Error(err), zap.ByteString("raw", msg))
 			continue
 		}
@@ -340,6 +346,7 @@ func handleMCP(ws *websocket.Conn, logger *zap.Logger) {
 			ID:      req.ID,
 		}
 
+		var hasError bool
 		switch req.Method {
 		case "initialize":
 			resp.Result = map[string]interface{}{
@@ -375,44 +382,57 @@ func handleMCP(ws *websocket.Conn, logger *zap.Logger) {
 			paramsBytes, _ := json.Marshal(req.Params)
 			var callParams CallToolParams
 			if err := json.Unmarshal(paramsBytes, &callParams); err != nil {
+				hasError = true
 				resp.Error = &MCPError{Code: -32602, Message: "Invalid params for call_tool"}
-				break
-			}
-
-			var result interface{}
-			var execErr error
-
-			switch callParams.Name {
-			case "search":
-				query, ok := callParams.Args["query"].(string)
-				if !ok || query == "" {
-					execErr = fmt.Errorf("missing 'query' argument")
-				} else {
-					result, execErr = searchTool(query, logger)
-				}
-			case "code_interpreter":
-				code, ok := callParams.Args["code"].(string)
-				if !ok || code == "" {
-					execErr = fmt.Errorf("missing 'code' argument")
-				} else {
-					output, err := executePythonInSandbox(code, logger)
-					if err != nil {
-						execErr = fmt.Errorf("sandbox execution failed: %w", err)
-					} else {
-						result = map[string]string{"output": output}
-					}
-				}
-			default:
-				execErr = fmt.Errorf("tool not found: %s", callParams.Name)
-			}
-
-			if execErr != nil {
-				resp.Error = &MCPError{Code: -32000, Message: execErr.Error()}
 			} else {
-				resp.Result = result
+				var result interface{}
+				var execErr error
+
+				start := time.Now()
+				switch callParams.Name {
+				case "search":
+					query, ok := callParams.Args["query"].(string)
+					if !ok || query == "" {
+						execErr = fmt.Errorf("missing 'query' argument")
+					} else {
+						result, execErr = searchTool(query, logger)
+					}
+					metricsMutex.Lock()
+					searchDuration += time.Since(start).Seconds()
+					metricsMutex.Unlock()
+				case "code_interpreter":
+					code, ok := callParams.Args["code"].(string)
+					if !ok || code == "" {
+						execErr = fmt.Errorf("missing 'code' argument")
+					} else {
+						output, err := executePythonInSandbox(code, logger)
+						if err != nil {
+							execErr = fmt.Errorf("sandbox execution failed: %w", err)
+						} else {
+							result = map[string]string{"output": output}
+						}
+					}
+					metricsMutex.Lock()
+					codeExecDuration += time.Since(start).Seconds()
+					metricsMutex.Unlock()
+				default:
+					execErr = fmt.Errorf("tool not found: %s", callParams.Name)
+				}
+
+				if execErr != nil {
+					hasError = true
+					resp.Error = &MCPError{Code: -32000, Message: execErr.Error()}
+				} else {
+					resp.Result = result
+				}
 			}
 		default:
+			hasError = true
 			resp.Error = &MCPError{Code: -32601, Message: "Method not found: " + req.Method}
+		}
+
+		if hasError {
+			atomic.AddInt64(&failedRequests, 1)
 		}
 
 		out, _ := json.Marshal(resp)
@@ -428,6 +448,7 @@ func main() {
 	logger, _ := zap.NewProduction()
 	defer logger.Sync()
 
+	// WebSocket endpoint
 	http.HandleFunc("/mcp", func(w http.ResponseWriter, r *http.Request) {
 		conn, err := upgrader.Upgrade(w, r, nil)
 		if err != nil {
@@ -437,9 +458,40 @@ func main() {
 		go handleMCP(conn, logger)
 	})
 
+	// Health check
 	http.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("ok"))
+	})
+
+	// Metrics endpoint (Day 4)
+	http.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
+		total := atomic.LoadInt64(&totalRequests)
+		failed := atomic.LoadInt64(&failedRequests)
+		success := total - failed
+
+		w.Header().Set("Content-Type", "text/plain; version=0.0.4")
+		fmt.Fprintf(w, "# HELP mcp_total_requests Total number of MCP requests\n")
+		fmt.Fprintf(w, "# TYPE mcp_total_requests counter\n")
+		fmt.Fprintf(w, "mcp_total_requests %d\n", total)
+
+		fmt.Fprintf(w, "# HELP mcp_failed_requests Number of failed MCP requests\n")
+		fmt.Fprintf(w, "# TYPE mcp_failed_requests counter\n")
+		fmt.Fprintf(w, "mcp_failed_requests %d\n", failed)
+
+		fmt.Fprintf(w, "# HELP mcp_success_requests Number of successful MCP requests\n")
+		fmt.Fprintf(w, "# TYPE mcp_success_requests counter\n")
+		fmt.Fprintf(w, "mcp_success_requests %d\n", success)
+
+		metricsMutex.RLock()
+		fmt.Fprintf(w, "# HELP mcp_code_exec_duration_seconds Total duration of code interpreter executions\n")
+		fmt.Fprintf(w, "# TYPE mcp_code_exec_duration_seconds counter\n")
+		fmt.Fprintf(w, "mcp_code_exec_duration_seconds %f\n", codeExecDuration)
+
+		fmt.Fprintf(w, "# HELP mcp_search_duration_seconds Total duration of search tool executions\n")
+		fmt.Fprintf(w, "# TYPE mcp_search_duration_seconds counter\n")
+		fmt.Fprintf(w, "mcp_search_duration_seconds %f\n", searchDuration)
+		metricsMutex.RUnlock()
 	})
 
 	server := &http.Server{
