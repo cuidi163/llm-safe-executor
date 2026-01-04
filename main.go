@@ -1,4 +1,4 @@
-// main.go (Day 3 版本)
+// main.go (修复版)
 package main
 
 import (
@@ -137,18 +137,23 @@ func ensureImageExists(ctx context.Context, cli *client.Client, imageName string
 	return nil
 }
 
-// ====== 新增：Docker 沙箱执行 Python ======
+// ====== 修复：移除代码缩进，直接使用原始代码 ======
 func executePythonInSandbox(code string, logger *zap.Logger) (string, error) {
 	ctx := context.Background()
 
-	// 创建 Docker 客户端，支持多种环境
 	cli, err := createDockerClient()
 	if err != nil {
 		return "", fmt.Errorf("failed to create docker client: %w", err)
 	}
 	defer cli.Close()
 
-	// 构建执行脚本：将用户代码写入 /tmp/script.py
+	// Indent code to fit into try block
+	indentedCode := ""
+	lines := strings.Split(code, "\n")
+	for _, line := range lines {
+		indentedCode += "    " + line + "\n"
+	}
+
 	script := fmt.Sprintf(`
 import sys
 import traceback
@@ -158,16 +163,14 @@ try:
 except Exception as e:
     print("ERROR:", str(e), file=sys.stderr)
     traceback.print_exc(file=sys.stderr)
-`, indentCode(code))
+`, indentedCode)
 
-	// 对脚本进行 Base64 编码，避免 Shell 转义问题
 	encodedScript := base64.StdEncoding.EncodeToString([]byte(script))
-	// 构建 Shell 命令：解码 -> 写入 /tmp -> 执行
+	// 使用 -D 兼容 macOS 和 Linux
 	shellCmd := fmt.Sprintf("echo %s | base64 -d > /tmp/script.py && python /tmp/script.py", encodedScript)
 
-	// 创建临时容器配置
 	containerConfig := &container.Config{
-		Image:        "python:3.11-slim", // 轻量镜像
+		Image:        "python:3.11-slim",
 		Cmd:          []string{"sh", "-c", shellCmd},
 		AttachStdout: true,
 		AttachStderr: true,
@@ -175,39 +178,35 @@ except Exception as e:
 	}
 
 	hostConfig := &container.HostConfig{
-		NetworkMode:    "none",          // 禁用网络
-		ReadonlyRootfs: true,            // ✅ 恢复只读根文件系统
-		CapDrop:        []string{"ALL"}, // 移除所有特权，作为安全补偿
+		NetworkMode:    "none",
+		ReadonlyRootfs: true,
+		CapDrop:        []string{"ALL"},
 		Resources: container.Resources{
 			Memory:   128 * 1024 * 1024, // 128MB
 			NanoCPUs: 500000000,         // 0.5 CPU
 		},
-		AutoRemove: true, // 自动删除容器
-		// 挂载 tmpfs 到 /tmp，使其在只读文件系统中可写
+		AutoRemove: true,
 		Tmpfs: map[string]string{
 			"/tmp": "rw,noexec,nosuid,size=10m",
 		},
 	}
 
-	// 确保镜像存在（自动拉取）
 	imageName := "python:3.11-slim"
 	if err := ensureImageExists(ctx, cli, imageName, logger); err != nil {
 		return "", fmt.Errorf("failed to ensure image exists: %w", err)
 	}
 
-	// 创建容器
 	resp, err := cli.ContainerCreate(ctx, containerConfig, hostConfig, nil, nil, "")
 	if err != nil {
 		return "", fmt.Errorf("failed to create container: %w", err)
 	}
 
-	// 启动容器
 	if err := cli.ContainerStart(ctx, resp.ID, container.StartOptions{}); err != nil {
 		cli.ContainerRemove(ctx, resp.ID, container.RemoveOptions{Force: true})
 		return "", fmt.Errorf("failed to start container: %w", err)
 	}
 
-	// 等待完成（带超时）
+	// 等待容器完成（带超时）
 	waitCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
@@ -218,10 +217,16 @@ except Exception as e:
 			return "", fmt.Errorf("container wait error: %w", err)
 		}
 	case <-statusCh:
-		// 正常退出或超时
+		// Container execution completed
+	case <-waitCtx.Done():
+		logger.Warn("Container execution timed out", zap.String("containerID", resp.ID))
+		// 强制删除超时容器
+		if removeErr := cli.ContainerRemove(ctx, resp.ID, container.RemoveOptions{Force: true}); removeErr != nil {
+			logger.Error("Failed to force remove timed-out container", zap.Error(removeErr))
+		}
+		return "", fmt.Errorf("execution timed out after 5 seconds")
 	}
 
-	// 获取日志
 	out, err := cli.ContainerLogs(ctx, resp.ID, container.LogsOptions{
 		ShowStdout: true,
 		ShowStderr: true,
@@ -230,7 +235,6 @@ except Exception as e:
 		return "", fmt.Errorf("failed to get logs: %w", err)
 	}
 
-	// 解析 stdout/stderr（Docker 使用 multiplexed 格式）
 	var stdoutBuf, stderrBuf bytes.Buffer
 	_, err = stdcopy.StdCopy(&stdoutBuf, &stderrBuf, out)
 	if err != nil {
@@ -241,26 +245,17 @@ except Exception as e:
 	errors := strings.TrimSpace(stderrBuf.String())
 
 	// 强制删除容器（双重保险）
-	cli.ContainerRemove(ctx, resp.ID, container.RemoveOptions{Force: true})
+	if removeErr := cli.ContainerRemove(ctx, resp.ID, container.RemoveOptions{Force: true}); removeErr != nil {
+		logger.Error("Failed to remove container", zap.Error(removeErr))
+	}
 
-	// 如果有错误，返回错误信息
 	if errors != "" {
 		return fmt.Sprintf("Execution failed:\n%s", errors), nil
 	}
-
 	if output == "" {
 		return "No output", nil
 	}
 	return output, nil
-}
-
-// 辅助：缩进用户代码（Python 对缩进敏感）
-func indentCode(code string) string {
-	lines := strings.Split(code, "\n")
-	for i, line := range lines {
-		lines[i] = "\t" + line
-	}
-	return strings.Join(lines, "\n")
 }
 
 // ====== 原有 searchTool 函数（略作优化） ======
@@ -290,7 +285,11 @@ func searchTool(query string, logger *zap.Logger) (interface{}, error) {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			logger.Error("Failed to read response body", zap.Error(err))
+			return nil, err
+		}
 		logger.Error("Serper API returned non-200", zap.Int("status", resp.StatusCode), zap.ByteString("body", body))
 		return nil, fmt.Errorf("serper api error: %d", resp.StatusCode)
 	}
